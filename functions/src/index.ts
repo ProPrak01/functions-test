@@ -68,6 +68,13 @@ interface ApproveOrgData {
     approved: boolean;
 }
 
+// Interface for anonymous message data
+interface AnonymousMessageData {
+    linkId: string;
+    message: string;
+    senderName: string;
+}
+
 // Simple test function with proper service account
 export const helloWorld = functions.https.onRequest({
     serviceAccount: "firebase-adminsdk-fbsvc@tickl-5c52c.iam.gserviceaccount.com"
@@ -705,6 +712,147 @@ export const createOrgAdminAndSendCredentials = functions.https.onCall({
         throw new functions.https.HttpsError(
             "internal",
             error instanceof Error ? error.message : "Failed to create admin and send credentials"
+        );
+    }
+});
+
+/**
+ * Generate public link on profile completion
+ * This trigger watches for user profile completion and generates a public link
+ */
+export const generatePublicLink = functions.firestore.onDocumentUpdated({
+    serviceAccount: "firebase-adminsdk-fbsvc@tickl-5c52c.iam.gserviceaccount.com",
+    document: "users/{userId}",
+    region: "us-central1",
+}, async (event) => {
+    try {
+        if (!event.data) {
+            logger.error("Event data is undefined");
+            return null;
+        }
+
+        const before = event.data.before.data();
+        const after = event.data.after.data();
+        const userId = event.params.userId;
+
+        // Only trigger when profile is newly completed
+        if (after.profileCompleted &&
+            (!before.profileCompleted || before.profileCompleted === false) &&
+            !after.publicLinkId) {
+
+            logger.info(`Generating public link for user: ${userId}`);
+
+            // Generate a unique ID (use a UUID library in production)
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let linkId = '';
+            for (let i = 0; i < 10; i++) {
+                linkId += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+
+            // Create link document
+            await admin.firestore().collection('userPublicLinks').doc(linkId).set({
+                userId: userId,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                isActive: true,
+                viewCount: 0,
+                messageCount: 0
+            });
+
+            // Update user with their link ID
+            await event.data.after.ref.update({
+                publicLinkId: linkId,
+                publicProfileEnabled: true
+            });
+
+            logger.info(`Public link generated for user ${userId}: ${linkId}`);
+            return { success: true, linkId };
+        }
+
+        return null;
+    } catch (error) {
+        logger.error("Error generating public link:", error);
+        return null;
+    }
+});
+
+/**
+ * Submit anonymous message
+ * This function handles anonymous message submission from public profile page
+ */
+export const submitAnonymousMessage = functions.https.onCall({
+    serviceAccount: "firebase-adminsdk-fbsvc@tickl-5c52c.iam.gserviceaccount.com"
+}, async (request: CallableRequest<AnonymousMessageData>) => {
+    try {
+        const { linkId, message, senderName } = request.data;
+
+        // Validate inputs
+        if (!linkId || !message || !senderName) {
+            throw new functions.https.HttpsError(
+                "invalid-argument",
+                "Missing required fields"
+            );
+        }
+
+        // Look up link to find recipient
+        const linkDoc = await admin.firestore().collection('userPublicLinks').doc(linkId).get();
+
+        if (!linkDoc.exists) {
+            throw new functions.https.HttpsError(
+                "not-found",
+                "Invalid link"
+            );
+        }
+
+        const linkData = linkDoc.data() as { userId: string, isActive: boolean };
+
+        // Check if link is active
+        if (!linkData.isActive) {
+            throw new functions.https.HttpsError(
+                "failed-precondition",
+                "This link is no longer active"
+            );
+        }
+
+        // Get recipient user
+        const userDoc = await admin.firestore().collection('users').doc(linkData.userId).get();
+
+        if (!userDoc.exists) {
+            throw new functions.https.HttpsError(
+                "not-found",
+                "Recipient user not found"
+            );
+        }
+
+        // Create anonymous message
+        const messageData = {
+            recipientId: linkData.userId,
+            senderName,
+            message,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false,
+            linkId,
+            ipAddress: request.rawRequest.ip || null
+        };
+
+        const messageRef = await admin.firestore().collection('anonymousMessages').add(messageData);
+
+        // Increment message count on the link
+        await linkDoc.ref.update({
+            messageCount: admin.firestore.FieldValue.increment(1),
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        logger.info(`Anonymous message sent to user ${linkData.userId} via link ${linkId}`);
+
+        return {
+            success: true,
+            messageId: messageRef.id
+        };
+    } catch (error) {
+        logger.error("Error submitting anonymous message:", error);
+        throw new functions.https.HttpsError(
+            "internal",
+            error instanceof Error ? error.message : "Failed to submit message"
         );
     }
 });
